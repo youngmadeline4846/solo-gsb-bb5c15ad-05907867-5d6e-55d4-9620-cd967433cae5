@@ -90,6 +90,66 @@ CREATE TABLE IF NOT EXISTS group_windows (
     updated_at          TEXT NOT NULL,
     PRIMARY KEY (group_id, window_start)
 );
+
+-- 组窗口修订快照：首次 ready 及每次迟到修正升版时，在同一事务追加一行，不可变。
+-- (group_id, window_start, revision) 唯一：重复上报 / 重复对账不重复留档。
+CREATE TABLE IF NOT EXISTS group_window_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id     TEXT NOT NULL,
+    window_start REAL NOT NULL,
+    window_end   REAL NOT NULL,
+    revision     INTEGER NOT NULL,                  -- 对应的组窗口 revision（首次 ready 为 1）
+    value        REAL NOT NULL,                     -- 该 revision 下的组 value（历史留档，不随后续修正变化）
+    aggregation  TEXT NOT NULL,                     -- sum | avg
+    member_count INTEGER NOT NULL,
+    ready_at     TEXT,                              -- 组窗口首次 ready 时间（baseline 补档保留原值）
+    created_at   TEXT NOT NULL,                     -- 快照生成时间（baseline 补档为迁移时间，不伪造历史）
+    UNIQUE (group_id, window_start, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gws_group_window
+    ON group_window_snapshots (group_id, window_start);
+
+-- 快照成员明细：固定成员在该 revision 时刻的 count/sum/avg/correction_count
+CREATE TABLE IF NOT EXISTS group_window_snapshot_members (
+    snapshot_id      INTEGER NOT NULL,
+    position         INTEGER NOT NULL,              -- 组成员顺序，diff / 明细按此排序
+    device_id        TEXT NOT NULL,
+    count            INTEGER NOT NULL,
+    sum              REAL NOT NULL,
+    avg              REAL NOT NULL,                 -- count=0 时记 0（ready 窗口实际上不会出现）
+    correction_count INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gwsm_snapshot
+    ON group_window_snapshot_members (snapshot_id);
+
+-- 快照只追加、不可修改、不可删除：后续迟到修正只能产生新 revision 快照，
+-- 触发器在数据库层拒绝任何 UPDATE / DELETE。
+CREATE TRIGGER IF NOT EXISTS trg_gws_immutable_update
+BEFORE UPDATE ON group_window_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'group_window_snapshots are append-only and immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_gws_immutable_delete
+BEFORE DELETE ON group_window_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'group_window_snapshots are append-only and immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_gwsm_immutable_update
+BEFORE UPDATE ON group_window_snapshot_members
+BEGIN
+    SELECT RAISE(ABORT, 'group_window_snapshot_members are append-only and immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_gwsm_immutable_delete
+BEFORE DELETE ON group_window_snapshot_members
+BEGIN
+    SELECT RAISE(ABORT, 'group_window_snapshot_members are append-only and immutable');
+END;
 """
 
 

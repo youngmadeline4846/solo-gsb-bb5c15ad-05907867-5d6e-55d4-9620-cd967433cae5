@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）与**组窗口修订审计**（每次升版在同事务追加不可变快照，支持版本列表与两版本 diff）。
 
 ## 核心语义
 
@@ -18,6 +18,14 @@
 - **聚合口径**：`sum` 为各成员窗口 `sum` 之和；`avg` 为各成员窗口 `avg`（窗口内事件均值）的算术平均，每个固定成员权重相同。
 - **修正原位升版**：成员窗口因迟到事件被修正后，已 ready 的组汇总在原记录上重算，`revision` 加一。系统以各成员窗口 `correction_count` 之和作为修正签名：同一 `event_id` 重试会被幂等去重、不产生新修正，签名不变，因此 **revision 不会重复升版**。ready 之前发生的修正包含在首次结果中，`revision` 从 1 起。
 - 组也可以在成员窗口已封存之后创建，创建时即补算历史窗口。
+
+### 组窗口修订审计（不可变快照）
+
+- **同事务留档**：组窗口**首次 ready**、以及之后每次迟到修正令 **revision 升版**时，系统在与组汇总更新**同一数据库事务**内追加一份快照，记录当时的组 `value` 与每个固定成员的 `count` / `sum` / `avg` / `correction_count`。
+- **重复上报不重复留档**：快照以 `(group_id, window_start, revision)` 唯一约束保证幂等；同一 `event_id` 重试不会产生新 revision，也不会重复写入快照。
+- **不可变**：快照表在数据库层（触发器）禁止 `UPDATE` / `DELETE`。后续迟到修正只会原位重算当前组窗口并追加**新 revision** 的快照，历史快照数值永不被覆盖。
+- **旧库升级 baseline**：服务初始化时只为**已 ready** 且尚无快照的组窗口补**一份**“当前 revision”的 baseline（`snapshot_created_at` 取迁移当下），不伪造无法重建的早期版本；pending 窗口不补。
+- **审计接口**：提供按窗口的 revision 列表、单 revision 详情（含逐成员数值）与两版本 diff。diff 按成员顺序**仅列发生变化的成员**，给出前后贡献（sum 组为成员窗口 `sum`，avg 组为成员窗口 `avg`）、贡献差以及四项数值的前后值与差值，并附组 value 的前后值与总差。版本号非法（非正整数或 `from >= to`）返回 `422`；组窗口不存在 / 尚未 ready / 版本不存在返回 `404`。
 
 ## 启动
 
@@ -287,6 +295,91 @@ curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/pending
 ]
 ```
 
+### 10. 组窗口修订审计：版本列表、详情与 diff
+
+```bash
+# 该组窗口的全部 revision 快照（按 revision 升序）
+curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revisions
+
+# 单个 revision 的详情：组 value + 每个固定成员当时的 count/sum/avg/correction_count
+curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revisions/1
+
+# 两版本 diff：按成员顺序仅列发生变化的成员（前后贡献、贡献差、四项数值差）
+curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revisions/1/diff/2
+```
+
+revision 列表响应示例：
+
+```json
+[
+  {
+    "group_id": "floor-1",
+    "window_start": "2026-09-22T10:00:00Z",
+    "window_end": "2026-09-22T10:01:00Z",
+    "revision": 1,
+    "value": 60.0,
+    "aggregation": "sum",
+    "member_count": 2,
+    "ready_at": "2026-09-22T10:02:31Z",
+    "snapshot_created_at": "2026-09-22T10:02:31Z"
+  },
+  {
+    "group_id": "floor-1",
+    "window_start": "2026-09-22T10:00:00Z",
+    "window_end": "2026-09-22T10:01:00Z",
+    "revision": 2,
+    "value": 65.0,
+    "aggregation": "sum",
+    "member_count": 2,
+    "ready_at": "2026-09-22T10:02:31Z",
+    "snapshot_created_at": "2026-09-22T10:03:10Z"
+  }
+]
+```
+
+revision 详情（`/revisions/2`）在上述字段基础上附带按成员顺序排列的 `members`：
+
+```json
+{
+  "revision": 2, "value": 65.0,
+  "members": [
+    {"position": 0, "device_id": "sensor-001", "count": 2, "sum": 45.0, "avg": 22.5, "correction_count": 1},
+    {"position": 1, "device_id": "sensor-002", "count": 1, "sum": 20.0, "avg": 20.0, "correction_count": 0}
+  ]
+}
+```
+
+两版本 diff（`/revisions/1/diff/2`）：未变化的成员不出现在 `members` 中。
+
+```json
+{
+  "group_id": "floor-1",
+  "window_start": "2026-09-22T10:00:00Z",
+  "window_end": "2026-09-22T10:01:00Z",
+  "aggregation": "sum",
+  "from_revision": 1,
+  "to_revision": 2,
+  "from_value": 60.0,
+  "to_value": 65.0,
+  "value_delta": 5.0,
+  "members": [
+    {
+      "position": 0,
+      "device_id": "sensor-001",
+      "before_contribution": 40.0,
+      "after_contribution": 45.0,
+      "contribution_delta": 5.0,
+      "before_count": 1, "after_count": 2, "count_delta": 1,
+      "before_sum": 40.0, "after_sum": 45.0, "sum_delta": 5.0,
+      "before_avg": 40.0, "after_avg": 22.5, "avg_delta": -17.5,
+      "before_correction_count": 0, "after_correction_count": 1, "correction_count_delta": 1
+    }
+  ]
+}
+```
+
+错误码：版本号为 `0` / 负数、或 `from_revision >= to_revision` 返回 `422`；组不存在、组窗口不存在或尚为 pending、版本快照不存在返回 `404`。快照本身不可修改、不可删除，后续修正只会追加新版本。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -302,16 +395,20 @@ curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/pending
 | `GET` | `/groups/{group_id}/windows` | 组窗口汇总列表（支持 `?status=pending\|ready&window_start=...`） |
 | `GET` | `/groups/{group_id}/windows/{window_start}` | 查询单个组窗口 |
 | `GET` | `/groups/{group_id}/windows/{window_start}/pending` | pending 成员明细（`missing`/`open`；ready 返回空列表） |
+| `GET` | `/groups/{group_id}/windows/{window_start}/revisions` | 组窗口修订快照列表（不可变，按 revision 升序；pending/不存在 404） |
+| `GET` | `/groups/{group_id}/windows/{window_start}/revisions/{revision}` | 单 revision 快照详情：组 value + 逐成员 count/sum/avg/correction_count（非法版本 422，不存在 404） |
+| `GET` | `/groups/{group_id}/windows/{window_start}/revisions/{from_revision}/diff/{to_revision}` | 两版本 diff：仅列变化成员的前后贡献与数值差（非法版本 422，不存在 404） |
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合与设备组同步窗口汇总逻辑
-  db.py          # SQLite 连接、建表与事务会话
+  main.py        # FastAPI 应用、遥测聚合、设备组同步窗口汇总与修订快照审计逻辑
+  db.py          # SQLite 连接、建表（含不可变快照表与触发器）与事务会话
 tests/
-  test_api.py    # 端到端测试（水位线/封存/去重/迟到修正/持久化）
-  test_groups.py # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
+  test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
+  test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
+  test_snapshots.py # 修订快照测试（同事务留档、幂等、不可变、diff、422/404、baseline 补档）
 Dockerfile
 docker-compose.yml
 requirements.txt
