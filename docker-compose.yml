@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      TELEMETRY_DB_PATH: /data/telemetry.db
+    volumes:
+      - telemetry-data:/data
+    restart: unless-stopped
+
+volumes:
+  telemetry-data:
