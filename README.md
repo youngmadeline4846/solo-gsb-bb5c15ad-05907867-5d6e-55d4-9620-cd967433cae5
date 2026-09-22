@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）与**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）。
 
 ## 核心语义
 
@@ -18,6 +18,17 @@
 - **聚合口径**：`sum` 为各成员窗口 `sum` 之和；`avg` 为各成员窗口 `avg`（窗口内事件均值）的算术平均，每个固定成员权重相同。
 - **修正原位升版**：成员窗口因迟到事件被修正后，已 ready 的组汇总在原记录上重算，`revision` 加一。系统以各成员窗口 `correction_count` 之和作为修正签名：同一 `event_id` 重试会被幂等去重、不产生新修正，签名不变，因此 **revision 不会重复升版**。ready 之前发生的修正包含在首次结果中，`revision` 从 1 起。
 - 组也可以在成员窗口已封存之后创建，创建时即补算历史窗口。
+
+### 组窗口修订审计（不可变快照）
+
+- **同事务留档**：组窗口**首次 ready**、以及迟到修正令 **revision 升版**时，在与组汇总写入的**同一事务**内追加一份不可变快照，记录当时的 group `value`，以及每个固定成员窗口当时的 `count`、`sum`、`avg`、`correction_count`。
+- **不重复留档**：快照以 `(group_id, window_start, revision)` 唯一约束兜底，重复上报（幂等去重、签名未推进）绝不会产生第二份同版本快照。
+- **不可变、不可覆盖**：审计表只允许 `INSERT`，数据库触发器会直接中止任何 `UPDATE`/`DELETE`；后续修正只追加新 revision 的快照，**历史快照永不被覆盖**。
+- **初始化只补基线**：旧版本数据库升级启动时，只对**已 ready** 但尚无快照的组窗口补一份**当前 revision** 的 baseline（标记 `kind=baseline`），**绝不伪造** ready 之后可能存在过的早期版本；新库及已有快照的窗口不受影响。
+- **审计接口**：提供修订列表与两版本 diff：
+  - 修订列表按 revision 升序返回每个快照的 `value`、`kind`（`revision`/`baseline`）与成员数；
+  - diff 按**成员顺序**返回每个**发生变化**成员的前后贡献（sum 聚合贡献为窗口 `sum`，avg 聚合贡献为窗口 `avg`）与 `count/sum/avg/correction_count` 的数值差，未变化成员不列出；
+  - 版本参数非法（缺失、`<1`、`from >= to`）返回 `422`；组、窗口或任一修订不存在返回 `404`。
 
 ## 启动
 
@@ -287,6 +298,62 @@ curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/pending
 ]
 ```
 
+### 10. 查询组窗口修订列表（不可变快照）
+
+组窗口每次首次 ready、以及迟到修正升版时，都会在同一事务留一份不可变快照：
+
+```bash
+curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revisions
+```
+
+```json
+[
+  {"revision": 1, "value": 62.3, "kind": "revision", "created_at": "2026-09-22T10:02:31Z", "member_count": 2},
+  {"revision": 2, "value": 67.8, "kind": "revision", "created_at": "2026-09-22T10:03:10Z", "member_count": 2}
+]
+```
+
+- 尚未 ready（pending）的窗口返回 `[]`；组或窗口不存在返回 `404`。
+- 旧版本数据库升级后首次启动，只会为已 ready 窗口补一份**当前 revision** 的 `baseline`，不伪造早期版本。
+- 快照只追加、不可修改：任何对审计表的 `UPDATE`/`DELETE` 都会被数据库触发器中止；同一 revision 重复上报也受唯一约束保护，不会重复留档。
+
+### 11. 对比两个 revision（diff）
+
+```bash
+curl 'http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/revisions/diff?from_revision=1&to_revision=2'
+```
+
+响应按成员顺序只列出发生变化的成员，给出前后贡献与各项数值差（`sum` 聚合下贡献为成员窗口 `sum`，`avg` 聚合下为成员窗口 `avg`）：
+
+```json
+{
+  "group_id": "floor-1",
+  "window_start": "2026-09-22T10:00:00Z",
+  "aggregation": "sum",
+  "from_revision": 1,
+  "to_revision": 2,
+  "from_value": 62.3,
+  "to_value": 67.8,
+  "value_delta": 5.5,
+  "members": [
+    {
+      "device_id": "sensor-001",
+      "position": 0,
+      "before": {"device_id": "sensor-001", "position": 0, "count": 3, "sum": 41.4, "avg": 13.8, "correction_count": 0, "contribution": 41.4},
+      "after":  {"device_id": "sensor-001", "position": 0, "count": 4, "sum": 46.9, "avg": 11.725, "correction_count": 1, "contribution": 46.9},
+      "count_delta": 1,
+      "sum_delta": 5.5,
+      "avg_delta": -2.075,
+      "correction_count_delta": 1,
+      "contribution_delta": 5.5
+    }
+  ]
+}
+```
+
+- `from_revision` / `to_revision` 均必填且 `>= 1`，且 `from_revision < to_revision`，否则返回 `422`。
+- 组、窗口不存在，或指定的任一 revision 无快照（例如 baseline 之前被伪造的旧版本号）返回 `404`。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -302,16 +369,19 @@ curl http://localhost:8000/groups/floor-1/windows/2026-09-22T10:00:00Z/pending
 | `GET` | `/groups/{group_id}/windows` | 组窗口汇总列表（支持 `?status=pending\|ready&window_start=...`） |
 | `GET` | `/groups/{group_id}/windows/{window_start}` | 查询单个组窗口 |
 | `GET` | `/groups/{group_id}/windows/{window_start}/pending` | pending 成员明细（`missing`/`open`；ready 返回空列表） |
+| `GET` | `/groups/{group_id}/windows/{window_start}/revisions` | 组窗口修订审计列表（不可变快照，含初始化 baseline） |
+| `GET` | `/groups/{group_id}/windows/{window_start}/revisions/diff?from_revision=&to_revision=` | 两版本 diff：按成员顺序返回变化成员的前后贡献与数值差（非法版本 422，不存在 404） |
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 应用、遥测聚合与设备组同步窗口汇总逻辑
-  db.py          # SQLite 连接、建表与事务会话
+  main.py        # FastAPI 应用、遥测聚合、设备组同步窗口汇总与修订审计快照逻辑
+  db.py          # SQLite 连接、建表（含 append-only 审计表/触发器）与事务会话
 tests/
-  test_api.py    # 端到端测试（水位线/封存/去重/迟到修正/持久化）
-  test_groups.py # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
+  test_api.py       # 端到端测试（水位线/封存/去重/迟到修正/持久化）
+  test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
+  test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -17,6 +17,16 @@
 - 成员窗口因迟到事件发生修正后，已生成的组汇总原位重算且 revision 加一；
 - 修正以成员窗口 correction_count 之和为签名：同一 event_id 重试是幂等去重，
   不会产生新修正，签名不变，revision 不重复升版。
+
+组窗口修订审计（append-only 快照）：
+- 组窗口首次 ready、以及迟到修正令 revision 升版时，在**同一事务**追加一份不可变快照，
+  记录当时的 group value 与每个固定成员窗口的 count、sum、avg、correction_count。
+- (group_id, window_start, revision) 唯一约束保证重复上报不会重复留档；
+  审计表带禁止 UPDATE/DELETE 的触发器，后续修正只能追加新版本、旧快照永不被覆盖。
+- 服务初始化时只对旧库中**已 ready** 的组窗口补一份**当前 revision** 的 baseline，
+  绝不伪造更早的历史版本。
+- 提供修订列表与两版本 diff 接口；diff 按成员顺序给出前后贡献与数值差，仅列发生变化的成员，
+  非法版本返回 422、不存在的组/窗口/修订返回 404。
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from . import db
@@ -40,10 +50,11 @@ MAX_GROUP_MEMBERS = 500
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    backfill_baseline_snapshots()
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.2.0", lifespan=lifespan)
 
 
 # ---------- Pydantic 模型 ----------
@@ -152,6 +163,48 @@ class PendingMemberOut(BaseModel):
     window_end: datetime
     window_status: Optional[Literal["open", "sealed"]] = None  # None = 成员尚无该窗口
     reason: Literal["missing", "open"]
+
+
+class GroupWindowRevisionOut(BaseModel):
+    revision: int
+    value: float
+    kind: Literal["revision", "baseline"]
+    created_at: datetime
+    member_count: int
+
+
+class RevisionMemberStateOut(BaseModel):
+    device_id: str
+    position: int
+    count: int
+    sum: float
+    avg: Optional[float] = None
+    correction_count: int
+    contribution: float  # 该成员当时对 group value 的贡献：sum 聚合为 sum，avg 聚合为窗口 avg
+
+
+class RevisionMemberDeltaOut(BaseModel):
+    device_id: str
+    position: int
+    before: RevisionMemberStateOut
+    after: RevisionMemberStateOut
+    count_delta: int
+    sum_delta: float
+    avg_delta: Optional[float] = None
+    correction_count_delta: int
+    contribution_delta: float
+
+
+class RevisionDiffOut(BaseModel):
+    group_id: str
+    window_start: datetime
+    aggregation: Literal["sum", "avg"]
+    from_revision: int
+    to_revision: int
+    from_value: float
+    to_value: float
+    value_delta: float
+    members: list[RevisionMemberDeltaOut]  # 仅含发生变化的成员，按成员顺序排列
 
 
 # ---------- 工具函数 ----------
@@ -274,13 +327,16 @@ def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
 
     for w_start in starts:
         w_end = w_start + size
-        win_rows = conn.execute(
-            f"SELECT w.* FROM windows w"
-            f" JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
-            f" WHERE w.window_start = ?",
-            (group_id, w_start),
-        ).fetchall()
-        sealed = [r for r in win_rows if r["status"] == "sealed"]
+        win_rows = {
+            r["device_id"]: r
+            for r in conn.execute(
+                f"SELECT w.* FROM windows w"
+                f" JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
+                f" WHERE w.window_start = ? ORDER BY m.position",
+                (group_id, w_start),
+            ).fetchall()
+        }
+        sealed = [win_rows[d] for d in members if d in win_rows and win_rows[d]["status"] == "sealed"]
         sealed_n = len(sealed)
         all_sealed = sealed_n == member_n
         correction_sig = sum(r["correction_count"] for r in sealed)
@@ -305,15 +361,22 @@ def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
                     " VALUES (?, ?, ?, 'ready', ?, ?, ?, 1, ?, ?, ?, ?)",
                     (group_id, w_start, w_end, value, member_n, member_n, correction_sig, now, now, now),
                 )
+                # 首次 ready：同一事务追加 revision=1 的不可变快照
+                append_revision_snapshot(conn, group_id, w_start, 1, value, members, win_rows, now)
             elif existing["status"] == "ready":
                 # 已生成的组汇总原位重算：仅当成员窗口出现新的迟到修正（签名推进）时升版。
                 # 同一 event_id 重试在 ingest 侧幂等去重，correction_count 不变，故不重复升版。
                 if correction_sig > existing["correction_sig"]:
+                    new_revision = existing["revision"] + 1
                     conn.execute(
                         "UPDATE group_windows SET status = 'ready', value = ?, sealed_member_count = ?,"
                         " revision = revision + 1, correction_sig = ?, updated_at = ?"
                         " WHERE group_id = ? AND window_start = ?",
                         (value, member_n, correction_sig, now, group_id, w_start),
+                    )
+                    # revision 升版：同一事务追加新快照；旧快照不动、绝不覆盖
+                    append_revision_snapshot(
+                        conn, group_id, w_start, new_revision, value, members, win_rows, now
                     )
             else:
                 # pending → ready（迟到修正发生在 ready 之前，已包含在首次结果里，revision 从 1 起）
@@ -323,6 +386,8 @@ def reconcile_group(conn: sqlite3.Connection, group_id: str, now: str) -> None:
                     " WHERE group_id = ? AND window_start = ?",
                     (value, member_n, correction_sig, now, now, group_id, w_start),
                 )
+                # pending → ready 的首次 ready：同一事务追加 revision=1 快照
+                append_revision_snapshot(conn, group_id, w_start, 1, value, members, win_rows, now)
         else:
             if existing is None:
                 conn.execute(
@@ -350,6 +415,100 @@ def reconcile_groups_for_device(conn: sqlite3.Connection, device_id: str, now: s
     ]
     for group_id in group_ids:
         reconcile_group(conn, group_id, now)
+
+
+def append_revision_snapshot(
+    conn: sqlite3.Connection,
+    group_id: str,
+    window_start: float,
+    revision: int,
+    value: float,
+    members: list[str],
+    win_rows: dict[str, sqlite3.Row],
+    now: str,
+    kind: Literal["revision", "baseline"] = "revision",
+) -> None:
+    """在当前事务内为组窗口的一个 revision 追加不可变快照。
+
+    快照头记录当时的 group value；成员明细按固定成员顺序记录每个成员窗口当时的
+    count/sum/avg/correction_count。(group_id, window_start, revision) 唯一约束兜底，
+    重复上报（签名未推进）不会再次进入这里，即使进入也会被约束挡下而不重复留档。
+    """
+    cur = conn.execute(
+        "INSERT INTO group_window_snapshots"
+        " (group_id, window_start, revision, value, kind, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (group_id, window_start, revision, value, kind, now),
+    )
+    snapshot_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO group_window_snapshot_members"
+        " (snapshot_id, group_id, device_id, position, count, sum, avg, correction_count)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                snapshot_id,
+                group_id,
+                device_id,
+                position,
+                win_rows[device_id]["count"],
+                win_rows[device_id]["sum"],
+                (
+                    win_rows[device_id]["sum"] / win_rows[device_id]["count"]
+                    if win_rows[device_id]["count"]
+                    else None
+                ),
+                win_rows[device_id]["correction_count"],
+            )
+            for position, device_id in enumerate(members)
+        ],
+    )
+
+
+def backfill_baseline_snapshots() -> None:
+    """旧库升级时为已 ready 但没有任何快照的组窗口补一份**当前 revision** 的 baseline。
+
+    只补当前版本这一份，绝不伪造 ready 之后可能存在过的早期版本；幂等：
+    已有任意快照的 ready 窗口跳过，新库（启动即为空）无任何可补数据。
+    """
+    now = utcnow_iso()
+    with db.session() as conn:
+        ready_rows = conn.execute(
+            "SELECT * FROM group_windows WHERE status = 'ready'"
+        ).fetchall()
+        for gw in ready_rows:
+            exists = conn.execute(
+                "SELECT 1 FROM group_window_snapshots"
+                " WHERE group_id = ? AND window_start = ? LIMIT 1",
+                (gw["group_id"], gw["window_start"]),
+            ).fetchone()
+            if exists:
+                continue
+
+            members = group_member_ids(conn, gw["group_id"])
+            win_rows = {
+                r["device_id"]: r
+                for r in conn.execute(
+                    "SELECT w.* FROM windows w"
+                    " JOIN device_group_members m ON m.device_id = w.device_id AND m.group_id = ?"
+                    " WHERE w.window_start = ?",
+                    (gw["group_id"], gw["window_start"]),
+                ).fetchall()
+            }
+            # 数据不自洽（有成员缺窗口）时不补，避免留下不完整的基线
+            if len(win_rows) != len(members):
+                continue
+            append_revision_snapshot(
+                conn,
+                gw["group_id"],
+                gw["window_start"],
+                gw["revision"],
+                gw["value"],
+                members,
+                win_rows,
+                now,
+                kind="baseline",
+            )
 
 
 def group_window_out(r: sqlite3.Row) -> GroupWindowOut:
@@ -732,3 +891,161 @@ def list_pending_members(group_id: str, window_start: datetime) -> list[PendingM
                     reason="open",
                 ))
         return result
+
+
+# ---------- 组窗口修订审计接口 ----------
+
+def _require_group_window(conn: sqlite3.Connection, group_id: str, w_start: float) -> sqlite3.Row:
+    require_group(conn, group_id)
+    gw = conn.execute(
+        "SELECT * FROM group_windows WHERE group_id = ? AND window_start = ?",
+        (group_id, w_start),
+    ).fetchone()
+    if gw is None:
+        raise HTTPException(status_code=404, detail="group window not found (no member has data yet)")
+    return gw
+
+
+def _require_snapshot(
+    conn: sqlite3.Connection, group_id: str, w_start: float, revision: int
+) -> sqlite3.Row:
+    snap = conn.execute(
+        "SELECT * FROM group_window_snapshots WHERE group_id = ? AND window_start = ? AND revision = ?",
+        (group_id, w_start, revision),
+    ).fetchone()
+    if snap is None:
+        raise HTTPException(
+            status_code=404, detail=f"revision not found: {revision}"
+        )
+    return snap
+
+
+def _snapshot_member_states(
+    conn: sqlite3.Connection, aggregation: str, snapshot_id: int
+) -> dict[str, dict]:
+    """读取某份快照的成员明细，并算出各成员当时对 group value 的贡献。"""
+    rows = conn.execute(
+        "SELECT * FROM group_window_snapshot_members WHERE snapshot_id = ? ORDER BY position",
+        (snapshot_id,),
+    ).fetchall()
+    states: dict[str, dict] = {}
+    for r in rows:
+        contribution = r["sum"] if aggregation == "sum" else (r["avg"] if r["avg"] is not None else 0.0)
+        states[r["device_id"]] = {
+            "device_id": r["device_id"],
+            "position": r["position"],
+            "count": r["count"],
+            "sum": r["sum"],
+            "avg": r["avg"],
+            "correction_count": r["correction_count"],
+            "contribution": contribution,
+        }
+    return states
+
+
+@app.get(
+    "/groups/{group_id}/windows/{window_start}/revisions",
+    response_model=list[GroupWindowRevisionOut],
+)
+def list_group_window_revisions(group_id: str, window_start: datetime) -> list[GroupWindowRevisionOut]:
+    """返回组窗口的修订审计列表（不可变快照），按 revision 升序。
+
+    组窗口存在但尚未 ready（无任何修订）时返回空列表；组或窗口不存在返回 404。
+    """
+    w_start = to_epoch(window_start)
+    with db.session() as conn:
+        _require_group_window(conn, group_id, w_start)
+        rows = conn.execute(
+            "SELECT s.*, ("
+            "  SELECT COUNT(*) FROM group_window_snapshot_members m WHERE m.snapshot_id = s.id"
+            " ) AS member_count"
+            " FROM group_window_snapshots s"
+            " WHERE s.group_id = ? AND s.window_start = ?"
+            " ORDER BY s.revision",
+            (group_id, w_start),
+        ).fetchall()
+        return [
+            GroupWindowRevisionOut(
+                revision=r["revision"],
+                value=r["value"],
+                kind=r["kind"],
+                created_at=r["created_at"],
+                member_count=r["member_count"],
+            )
+            for r in rows
+        ]
+
+
+@app.get(
+    "/groups/{group_id}/windows/{window_start}/revisions/diff",
+    response_model=RevisionDiffOut,
+)
+def diff_group_window_revisions(
+    group_id: str,
+    window_start: datetime,
+    from_revision: int = Query(..., ge=1),
+    to_revision: int = Query(..., ge=1),
+) -> RevisionDiffOut:
+    """对比组窗口两个 revision 的不可变快照。
+
+    按成员顺序返回每个发生变化成员的前后贡献与各数值差（count/sum/avg/correction_count），
+    仅列变化成员。from/to 必须为 >=1 且 from < to，否则 422；
+    组、窗口或任一 revision 不存在返回 404。
+    """
+    if from_revision >= to_revision:
+        raise HTTPException(
+            status_code=422, detail="from_revision must be a positive revision smaller than to_revision"
+        )
+
+    w_start = to_epoch(window_start)
+    with db.session() as conn:
+        _require_group_window(conn, group_id, w_start)
+        group = conn.execute(
+            "SELECT aggregation FROM device_groups WHERE group_id = ?", (group_id,)
+        ).fetchone()
+        snap_from = _require_snapshot(conn, group_id, w_start, from_revision)
+        snap_to = _require_snapshot(conn, group_id, w_start, to_revision)
+
+        before_states = _snapshot_member_states(conn, group["aggregation"], snap_from["id"])
+        after_states = _snapshot_member_states(conn, group["aggregation"], snap_to["id"])
+
+        member_deltas: list[RevisionMemberDeltaOut] = []
+        for device_id in sorted(set(before_states) | set(after_states),
+                                key=lambda d: after_states.get(d, before_states[d])["position"]):
+            b = before_states.get(device_id)
+            a = after_states.get(device_id)
+            if b is None or a is None or (
+                b["count"], b["sum"], b["avg"], b["correction_count"]
+            ) != (
+                a["count"], a["sum"], a["avg"], a["correction_count"]
+            ):
+                # 固定成员组两侧成员集合必然相同；任一缺失视为变化（防御性处理）
+                b = b or a
+                a = a or b
+                member_deltas.append(RevisionMemberDeltaOut(
+                    device_id=device_id,
+                    position=a["position"],
+                    before=RevisionMemberStateOut(**b),
+                    after=RevisionMemberStateOut(**a),
+                    count_delta=a["count"] - b["count"],
+                    sum_delta=a["sum"] - b["sum"],
+                    avg_delta=(
+                        a["avg"] - b["avg"]
+                        if a["avg"] is not None and b["avg"] is not None
+                        else None
+                    ),
+                    correction_count_delta=a["correction_count"] - b["correction_count"],
+                    contribution_delta=a["contribution"] - b["contribution"],
+                ))
+
+        return RevisionDiffOut(
+            group_id=group_id,
+            window_start=to_iso(w_start),
+            aggregation=group["aggregation"],
+            from_revision=from_revision,
+            to_revision=to_revision,
+            from_value=snap_from["value"],
+            to_value=snap_to["value"],
+            value_delta=snap_to["value"] - snap_from["value"],
+            members=member_deltas,
+        )
